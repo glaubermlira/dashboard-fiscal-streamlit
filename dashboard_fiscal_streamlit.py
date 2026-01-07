@@ -1,180 +1,305 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import os
-import unicodedata
+from io import BytesIO
+from datetime import datetime
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
 
-# -----------------------------------------
-# Configuração da página
-# -----------------------------------------
-st.set_page_config(
-    page_title="Dashboard Fiscal • Inteligência de Faturamento",
-    layout="wide"
-)
+# ==============================
+# FUNÇÕES DE SUPORTE
+# ==============================
 
-st.title("📊 Dashboard Fiscal • Análise e Intelligence")
-st.write("Painel fiscal preparado para múltiplos layouts de planilhas.")
+def normalizar_colunas(df):
+    mapping = {}
 
-# -----------------------------------------
-# Funções utilitárias
-# -----------------------------------------
+    cols_norm = {c.lower().strip(): c for c in df.columns}
 
-def normalizar(texto):
-    """Remove acentuação e caracteres que atrapalham o matching."""
-    if not isinstance(texto, str):
-        return texto
-    texto = unicodedata.normalize("NFD", texto)
-    texto = ''.join(
-        c for c in texto
-        if unicodedata.category(c) != "Mn"
+    def pick(options, default=None):
+        for o in options:
+            if o.lower() in cols_norm:
+                return cols_norm[o.lower()]
+        return default
+
+    mapping["data"] = pick(["data", "emissão", "data emissão"])
+    mapping["cliente"] = pick(["razão social/nome", "cliente", "nome", "razao social"])
+    mapping["valor"] = pick(["total", "valor total", "venda", "valor"])
+    mapping["cfop"] = pick(["cfop"])
+    mapping["produto"] = pick(["produto", "item", "descrição produto"])
+    mapping["documento"] = pick(["nº", "numero", "nf", "nota"])
+
+    return mapping
+
+
+def preparar_dataframe(df, col):
+    if col["data"]:
+        df["__data__"] = pd.to_datetime(df[col["data"]], errors="coerce", dayfirst=True)
+        df["ano"] = df["__data__"].dt.year
+        df["mes"] = df["__data__"].dt.month
+    else:
+        df["ano"] = None
+        df["mes"] = None
+
+    df["valor_num"] = pd.to_numeric(df[col["valor"]], errors="coerce").fillna(0)
+
+    df["cliente_norm"] = (
+        df[col["cliente"]].astype(str).str.strip().str.upper()
+        if col["cliente"] else "DESCONHECIDO"
     )
-    texto = texto.lower().replace(" ", "").replace("_", "").replace("-", "")
-    return texto
 
-def localizar_coluna(possiveis, df):
-    """
-    Tenta localizar no DataFrame colunas parecidas
-    com as palavras-chave informadas.
-    """
-    for alvo in possiveis:
-        alvo_norm = normalizar(alvo)
-        for col in df.columns:
-            if normalizar(col) == alvo_norm:
-                return col
-    return None
+    return df
 
-def validar_campos(obrigatorios, col_map):
-    faltando = [c for c in obrigatorios if col_map.get(c) is None]
-    if faltando:
-        st.error(f"⚠️ O arquivo não possui as colunas essenciais:")
-        st.error(", ".join(faltando))
-        st.write("📋 Colunas detectadas no arquivo:", df.columns.tolist())
-        st.stop()
 
-# -----------------------------------------
-# Upload ou arquivo padrão
-# -----------------------------------------
-DEFAULT_FILE = "relatorio_nfe_default.xlsx"
+# ==============================
+# EXPORTAÇÃO EXCEL
+# ==============================
 
-file = st.file_uploader(
-    "📥 Envie uma planilha (Excel/CSV) — ou deixe em branco para usar a padrão",
-    type=["xlsx","csv"]
+def exportar_excel(df):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="dados")
+    return output.getvalue()
+
+
+# ==============================
+# EXPORTAÇÃO PDF (ReportLab)
+# ==============================
+
+def exportar_pdf(df, titulo="Relatório"):
+    output = BytesIO()
+    doc = SimpleDocTemplate(output)
+    styles = getSampleStyleSheet()
+
+    story = []
+    story.append(Paragraph(titulo, styles["Title"]))
+    story.append(Spacer(1, 10))
+
+    tabela = [list(df.columns)] + df.astype(str).values.tolist()
+
+    t = Table(tabela)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0),( -1,0), colors.lightgrey),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+        ('FONT', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1),
+         [colors.whitesmoke, colors.lightyellow])
+    ]))
+
+    story.append(t)
+    doc.build(story)
+
+    return output.getvalue()
+
+
+# ==============================
+# CURVA ABC
+# ==============================
+
+def curva_abc(df, chave, valor_col="valor_num"):
+    agrupado = df.groupby(chave)[valor_col].sum().reset_index()
+    agrupado = agrupado.sort_values(valor_col, ascending=False)
+    total = agrupado[valor_col].sum()
+
+    agrupado["percent"] = agrupado[valor_col] / total
+    agrupado["acumulado"] = agrupado["percent"].cumsum()
+
+    def classe(v):
+        if v <= 0.8: return "A"
+        if v <= 0.95: return "B"
+        return "C"
+
+    agrupado["classe"] = agrupado["acumulado"].apply(classe)
+    return agrupado
+
+
+# ==============================
+# APP
+# ==============================
+
+st.set_page_config("Dashboard Fiscal", layout="wide")
+st.title("📊 Dashboard Fiscal & Faturamento")
+
+st.sidebar.header("Upload de Arquivo")
+file = st.sidebar.file_uploader("Selecione o arquivo", type=["xlsx", "csv"])
+
+if not file:
+    st.info("Envie um arquivo para iniciar a análise.")
+    st.stop()
+
+df = pd.read_excel(file) if file.name.endswith("xlsx") else pd.read_csv(file)
+
+col = normalizar_colunas(df)
+
+essenciais = ["data", "cliente", "valor"]
+faltando = [c for c in essenciais if not col[c]]
+
+if faltando:
+    st.error(f"⚠ O arquivo não possui as colunas essenciais: {', '.join(faltando)}")
+    st.stop()
+
+df = preparar_dataframe(df, col)
+
+# ==============================
+# FILTROS
+# ==============================
+
+anos = sorted(df["ano"].dropna().unique())
+ano_sel = st.sidebar.selectbox("Ano", anos)
+
+meses = sorted(df[df["ano"] == ano_sel]["mes"].dropna().unique())
+mes_sel = st.sidebar.multiselect("Meses", meses, default=meses)
+
+comparar = st.sidebar.checkbox("Comparar com outro ano")
+
+ano_comp = None
+if comparar and len(anos) > 1:
+    ano_comp = st.sidebar.selectbox("Ano comparação", [a for a in anos if a != ano_sel])
+
+
+df_filtrado = df[(df["ano"] == ano_sel) & (df["mes"].isin(mes_sel))]
+
+
+# ==============================
+# KPIs
+# ==============================
+
+faturamento = df_filtrado["valor_num"].sum()
+clientes_ativos = df_filtrado["cliente_norm"].nunique()
+ticket_medio = faturamento / max(clientes_ativos,1)
+
+top5 = (
+    df_filtrado.groupby("cliente_norm")["valor_num"].sum()
+    .sort_values(ascending=False)
+)
+conc_top5 = top5.head(5).sum() / faturamento if faturamento else 0
+
+kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+
+kpi1.metric("💰 Faturamento", f"R$ {faturamento:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+kpi2.metric("👥 Clientes Ativos", clientes_ativos)
+kpi3.metric("🏷 Ticket Médio", f"R$ {ticket_medio:,.2f}")
+kpi4.metric("🏦 Concentração Top 5", f"{conc_top5*100:.1f}%")
+kpi5.metric("📆 Meses Selecionados", len(mes_sel))
+
+
+# ==============================
+# EVOLUÇÃO TEMPORAL
+# ==============================
+
+st.subheader("📈 Evolução Mensal do Faturamento")
+
+evol = (
+    df_filtrado.groupby("mes")["valor_num"].sum()
+    .reset_index()
+    .sort_values("mes")
 )
 
-if file:
-    st.success(f"Arquivo recebido: {file.name}")
-    df = pd.read_excel(file) if file.name.lower().endswith(".xlsx") else pd.read_csv(file)
-else:
-    st.warning("Nenhum arquivo enviado. Usando arquivo padrão.")
-    if not os.path.exists(DEFAULT_FILE):
-        st.error(f"Arquivo padrão não encontrado: {DEFAULT_FILE}")
-        st.stop()
-    df = pd.read_excel(DEFAULT_FILE)
+st.line_chart(evol, x="mes", y="valor_num")
 
-# -----------------------------------------
-# DETECÇÃO AUTOMÁTICA DE COLUNAS
-# -----------------------------------------
+# Botões de exportação
+colA, colB = st.columns(2)
+with colA:
+    st.download_button("⬇ Exportar Excel", exportar_excel(evol),
+                       file_name="evolucao_mensal.xlsx")
+with colB:
+    st.download_button("⬇ Exportar PDF", exportar_pdf(evol, "Evolução Mensal"),
+                       file_name="evolucao_mensal.pdf")
 
-col = {
-    "data": localizar_coluna(["data", "data_emissao", "emissao"], df),
-    "cliente": localizar_coluna(["cliente", "razao_social", "nome_cliente"], df),
-    "valor": localizar_coluna(["valor_total","valor_nf","total","valor"], df),
-    "produto": localizar_coluna(["produto","descricao","item","servico"], df),
-    "segmento": localizar_coluna(["segmento","categoria","setor"], df),
-    "cfop": localizar_coluna(["cfop"], df),
-    "cst": localizar_coluna(["cst","csosn"], df),
-}
 
-validar_campos(["data","cliente","valor"], col)
+# ==============================
+# COMPARAÇÃO ENTRE ANOS
+# ==============================
 
-# -----------------------------------------
-# NORMALIZAÇÃO DO DATAFRAME
-# -----------------------------------------
-df.columns = [c.strip() for c in df.columns]
+if ano_comp:
+    st.subheader(f"⚖ Comparação {ano_sel} × {ano_comp}")
 
-df["Data"] = pd.to_datetime(df[col["data"]], errors="coerce")
-df["Cliente"] = df[col["cliente"]]
-df["ValorNF"] = pd.to_numeric(df[col["valor"]], errors="coerce").fillna(0)
+    df_comp = df[df["ano"].isin([ano_sel, ano_comp])]
+    comp = (
+        df_comp.groupby(["ano","mes"])["valor_num"].sum()
+        .reset_index()
+        .sort_values(["ano","mes"])
+    )
 
-optional_cols = {}
-if col.get("produto"): optional_cols["Produto"] = col["produto"]
-if col.get("segmento"): optional_cols["Segmento"] = col["segmento"]
-if col.get("cfop"): optional_cols["CFOP"] = col["cfop"]
-if col.get("cst"): optional_cols["CST"] = col["cst"]
+    st.area_chart(comp, x="mes", y="valor_num", color="ano")
 
-for novo, antigo in optional_cols.items():
-    df[novo] = df[antigo]
 
-df = df.dropna(subset=["Data","Cliente"])
+# ==============================
+# TOP 10 CLIENTES
+# ==============================
 
-# -----------------------------------------
-# HARD ANDROID EXPLAINER
-# -----------------------------------------
-with st.expander("📋 Mapeamento de Colunas"):
-    st.write("Colunas originais:", list(df.columns))
-    st.write("Mapeadas como:", col)
+st.subheader("🏆 Top 10 Clientes")
 
-# -----------------------------------------
-# Campos derivados
-# -----------------------------------------
-df["ano"] = df["Data"].dt.year
-df["mes"] = df["Data"].dt.to_period("M")
-df["trimestre"] = df["Data"].dt.to_period("Q")
-df["mes_num"] = df["Data"].dt.month
-df["freq"] = 1
+top10 = (
+    df_filtrado.groupby("cliente_norm")["valor_num"].sum()
+    .reset_index()
+    .sort_values("valor_num", ascending=False)
+    .head(10)
+)
 
-# -----------------------------------------
-# KPIs
-# -----------------------------------------
-st.header("📌 Indicadores de Desempenho")
+st.bar_chart(top10, x="cliente_norm", y="valor_num")
 
-faturamento_total = df["ValorNF"].sum()
-mensal = df.groupby("mes")["ValorNF"].sum().sort_index()
-faturamento_mensal = mensal.iloc[-1] if len(mensal) else 0
-clientes_ativos = df["Cliente"].nunique()
-ticket_medio = faturamento_total / len(df) if len(df) else 0
-top5 = df.groupby("Cliente")["ValorNF"].sum().sort_values(ascending=False).head(5)
-concentracao_top5 = top5.sum() / faturamento_total if faturamento_total > 0 else 0
+colA, colB = st.columns(2)
+with colA:
+    st.download_button("⬇ Exportar Excel", exportar_excel(top10),
+                       file_name="top10_clientes.xlsx")
+with colB:
+    st.download_button("⬇ Exportar PDF", exportar_pdf(top10, "Top 10 Clientes"),
+                       file_name="top10_clientes.pdf")
 
-col1,col2,col3,col4,col5 = st.columns(5)
-col1.metric("💰 Faturamento Total", f"R$ {faturamento_total:,.2f}")
-col2.metric("🗓️ Faturamento Mensal Atual", f"R$ {faturamento_mensal:,.2f}")
-col3.metric("👥 Clientes Ativos", clientes_ativos)
-col4.metric("💳 Ticket Médio", f"R$ {ticket_medio:,.2f}")
-col5.metric("⚠️ Concentração Top 5", f"{concentracao_top5:.2%}")
-st.divider()
 
-# -----------------------------------------
-# Análises Pedidas
-# -----------------------------------------
-st.subheader("📈 Evolução Temporal do Faturamento")
-st.line_chart(mensal)
+# ==============================
+# CURVA ABC CLIENTES
+# ==============================
 
-st.subheader("📊 Top 10 Clientes por Faturamento")
-top10 = df.groupby("Cliente")["ValorNF"].sum().sort_values(ascending=False).head(10)
-st.bar_chart(top10)
+st.subheader("📊 Curva ABC — Clientes")
 
-st.subheader("🔎 Matriz Cliente: Valor x Frequência")
-matriz = df.groupby("Cliente").agg(valor_total=("ValorNF","sum"), freq=("freq","sum"))
-st.scatter_chart(matriz)
+abc_clientes = curva_abc(df_filtrado, "cliente_norm")
+st.dataframe(abc_clientes)
 
-st.subheader("📆 Sazonalidade — Receita Mensal")
-sazonalidade = df.groupby("mes_num")["ValorNF"].sum().reindex(range(1,13), fill_value=0)
-st.bar_chart(sazonalidade)
+colA, colB = st.columns(2)
+with colA:
+    st.download_button("⬇ Excel ABC", exportar_excel(abc_clientes),
+                       file_name="curva_abc_clientes.xlsx")
+with colB:
+    st.download_button("⬇ PDF ABC", exportar_pdf(abc_clientes, "Curva ABC Clientes"),
+                       file_name="curva_abc_clientes.pdf")
 
-st.subheader("📊 Evolução Trimestral de Receita")
-trimestral = df.groupby("trimestre")["ValorNF"].sum()
-st.line_chart(trimestral)
 
-st.subheader("📦 Distribuição de Ticket Médio por Cliente")
-ticket = df.groupby("Cliente")["ValorNF"].mean()
-st.bar_chart(ticket)
+# ==============================
+# CURVA ABC PRODUTOS (SE EXISTIR)
+# ==============================
 
-st.subheader("🏆 Curva ABC de Clientes")
-abc = df.groupby("Cliente")["ValorNF"].sum().sort_values(ascending=False).reset_index()
-abc["%"] = abc["ValorNF"] / abc["ValorNF"].sum()
-abc["%_acum"] = abc["%"].cumsum()
-abc["Classe"] = abc["%_acum"].apply(lambda x: "A" if x<=0.8 else ("B" if x<=0.95 else "C"))
-st.dataframe(abc)
+if col["produto"]:
+    st.subheader("📦 Curva ABC — Produtos")
+    abc_prod = curva_abc(df_filtrado, col["produto"])
+    st.dataframe(abc_prod)
 
-st.info("📊 Dashboard pronto para uso em produção.")
+    colA, colB = st.columns(2)
+    with colA:
+        st.download_button("⬇ Excel", exportar_excel(abc_prod),
+                           file_name="curva_abc_produtos.xlsx")
+    with colB:
+        st.download_button("⬇ PDF", exportar_pdf(abc_prod, "Curva ABC Produtos"),
+                           file_name="curva_abc_produtos.pdf")
+
+
+# ==============================
+# MATRIZ CLIENTE (VALOR x FREQUÊNCIA)
+# ==============================
+
+st.subheader("🧩 Matriz Cliente (Valor × Frequência)")
+
+matriz = (
+    df_filtrado.groupby("cliente_norm")
+    .agg(
+        faturamento=("valor_num","sum"),
+        frequencia=("documento","count") if col["documento"] else ("valor_num","count")
+    )
+    .reset_index()
+)
+
+st.scatter_chart(matriz, x="frequencia", y="faturamento")
+
+st.download_button("⬇ Exportar Excel", exportar_excel(matriz),
+                   file_name="matriz_cliente.xlsx")
