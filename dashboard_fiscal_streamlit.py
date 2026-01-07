@@ -2,282 +2,179 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
+import unicodedata
 
-# ==========================================
-# CONFIGURAÇÃO DO APP
-# ==========================================
-
+# -----------------------------------------
+# Configuração da página
+# -----------------------------------------
 st.set_page_config(
-    page_title="Dashboard Fiscal — Inteligência de Faturamento",
+    page_title="Dashboard Fiscal • Inteligência de Faturamento",
     layout="wide"
 )
 
-st.title("📊 Dashboard Fiscal — Inteligência de Faturamento & Compliance")
-st.write("Modelo analítico consolidado para gestão fiscal, financeira e comercial")
+st.title("📊 Dashboard Fiscal • Análise e Intelligence")
+st.write("Painel fiscal preparado para múltiplos layouts de planilhas.")
 
-DEFAULT_FILE = "relatorio_nfe_default.xlsx"
+# -----------------------------------------
+# Funções utilitárias
+# -----------------------------------------
 
+def normalizar(texto):
+    """Remove acentuação e caracteres que atrapalham o matching."""
+    if not isinstance(texto, str):
+        return texto
+    texto = unicodedata.normalize("NFD", texto)
+    texto = ''.join(
+        c for c in texto
+        if unicodedata.category(c) != "Mn"
+    )
+    texto = texto.lower().replace(" ", "").replace("_", "").replace("-", "")
+    return texto
 
-# ==========================================
-# FUNÇÃO DE CARREGAMENTO
-# ==========================================
+def localizar_coluna(possiveis, df):
+    """
+    Tenta localizar no DataFrame colunas parecidas
+    com as palavras-chave informadas.
+    """
+    for alvo in possiveis:
+        alvo_norm = normalizar(alvo)
+        for col in df.columns:
+            if normalizar(col) == alvo_norm:
+                return col
+    return None
 
-def load_dataframe(source):
-    try:
-        if isinstance(source, str):
-            return pd.read_excel(source)
-
-        name = source.name.lower()
-
-        if name.endswith(".xlsx"):
-            return pd.read_excel(source)
-        return pd.read_csv(source)
-
-    except Exception as e:
-        st.error("Erro ao carregar dados")
-        st.exception(e)
+def validar_campos(obrigatorios, col_map):
+    faltando = [c for c in obrigatorios if col_map.get(c) is None]
+    if faltando:
+        st.error(f"⚠️ O arquivo não possui as colunas essenciais:")
+        st.error(", ".join(faltando))
+        st.write("📋 Colunas detectadas no arquivo:", df.columns.tolist())
         st.stop()
 
-
-# ==========================================
-# UPLOAD + ARQUIVO PADRÃO
-# ==========================================
-
-st.subheader("📂 Fonte de Dados")
+# -----------------------------------------
+# Upload ou arquivo padrão
+# -----------------------------------------
+DEFAULT_FILE = "relatorio_nfe_default.xlsx"
 
 file = st.file_uploader(
-    "Envie o relatório fiscal (Excel/CSV) — ou deixe vazio para usar o arquivo padrão",
-    type=["xlsx", "csv"]
+    "📥 Envie uma planilha (Excel/CSV) — ou deixe em branco para usar a padrão",
+    type=["xlsx","csv"]
 )
 
 if file:
-    st.success(f"Arquivo carregado: {file.name}")
-    df = load_dataframe(file)
-
+    st.success(f"Arquivo recebido: {file.name}")
+    df = pd.read_excel(file) if file.name.lower().endswith(".xlsx") else pd.read_csv(file)
 else:
-    st.warning("Nenhum arquivo carregado — usando arquivo padrão")
-
+    st.warning("Nenhum arquivo enviado. Usando arquivo padrão.")
     if not os.path.exists(DEFAULT_FILE):
-        st.error("Arquivo padrão não encontrado no repositório.")
+        st.error(f"Arquivo padrão não encontrado: {DEFAULT_FILE}")
         st.stop()
+    df = pd.read_excel(DEFAULT_FILE)
 
-    df = load_dataframe(DEFAULT_FILE)
-
-
-# ==========================================
-# NORMALIZAÇÃO DE COLUNAS
-# ==========================================
-
-def localizar_coluna(possiveis, df):
-    for p in possiveis:
-        for c in df.columns:
-            if c.strip().lower() == p.strip().lower():
-                return c
-    return None
+# -----------------------------------------
+# DETECÇÃO AUTOMÁTICA DE COLUNAS
+# -----------------------------------------
 
 col = {
-    "data": localizar_coluna(["data", "data emissão", "dt_emissao", "emissao"], df),
-    "cliente": localizar_coluna(["cliente", "razao social", "destinatário"], df),
-    "produto": localizar_coluna(["produto", "item", "descricao produto"], df),
-    "valor": localizar_coluna(["valornf", "valor total", "total nf", "vnf", "vl_total"], df),
+    "data": localizar_coluna(["data", "data_emissao", "emissao"], df),
+    "cliente": localizar_coluna(["cliente", "razao_social", "nome_cliente"], df),
+    "valor": localizar_coluna(["valor_total","valor_nf","total","valor"], df),
+    "produto": localizar_coluna(["produto","descricao","item","servico"], df),
+    "segmento": localizar_coluna(["segmento","categoria","setor"], df),
+    "cfop": localizar_coluna(["cfop"], df),
+    "cst": localizar_coluna(["cst","csosn"], df),
 }
 
-faltando = [k for k,v in col.items() if v is None]
-if faltando:
-    st.error(f"As seguintes colunas não foram encontradas: {faltando}")
-    st.stop()
+validar_campos(["data","cliente","valor"], col)
 
+# -----------------------------------------
+# NORMALIZAÇÃO DO DATAFRAME
+# -----------------------------------------
+df.columns = [c.strip() for c in df.columns]
 
+df["Data"] = pd.to_datetime(df[col["data"]], errors="coerce")
+df["Cliente"] = df[col["cliente"]]
+df["ValorNF"] = pd.to_numeric(df[col["valor"]], errors="coerce").fillna(0)
 
-# ==========================================
-# CAMPOS DERIVADOS
-# ==========================================
+optional_cols = {}
+if col.get("produto"): optional_cols["Produto"] = col["produto"]
+if col.get("segmento"): optional_cols["Segmento"] = col["segmento"]
+if col.get("cfop"): optional_cols["CFOP"] = col["cfop"]
+if col.get("cst"): optional_cols["CST"] = col["cst"]
 
-df["ano"] = df[col["data"]].dt.year
-df["mes"] = df[col["data"]].dt.to_period("M")
-df["trimestre"] = df[col["data"]].dt.to_period("Q")
-df["mes_num"] = df[col["data"]].dt.month
+for novo, antigo in optional_cols.items():
+    df[novo] = df[antigo]
 
-# KPI auxiliares
+df = df.dropna(subset=["Data","Cliente"])
+
+# -----------------------------------------
+# HARD ANDROID EXPLAINER
+# -----------------------------------------
+with st.expander("📋 Mapeamento de Colunas"):
+    st.write("Colunas originais:", list(df.columns))
+    st.write("Mapeadas como:", col)
+
+# -----------------------------------------
+# Campos derivados
+# -----------------------------------------
+df["ano"] = df["Data"].dt.year
+df["mes"] = df["Data"].dt.to_period("M")
+df["trimestre"] = df["Data"].dt.to_period("Q")
+df["mes_num"] = df["Data"].dt.month
 df["freq"] = 1
 
+# -----------------------------------------
+# KPIs
+# -----------------------------------------
+st.header("📌 Indicadores de Desempenho")
 
-# ==========================================
-# KPIs PRINCIPAIS
-# ==========================================
-
-st.header("📌 Indicadores-Chave de Desempenho (KPIs)")
-
-faturamento_total = df[col["valor"]].sum()
-
-mensal = (
-    df.groupby("mes")[col["valor"]]
-    .sum()
-    .sort_index()
-)
-
+faturamento_total = df["ValorNF"].sum()
+mensal = df.groupby("mes")["ValorNF"].sum().sort_index()
 faturamento_mensal = mensal.iloc[-1] if len(mensal) else 0
-
-clientes_ativos = df[col["cliente"]].nunique()
-
-ticket_medio = faturamento_total / len(df) if len(df) > 0 else 0
-
-top5 = (
-    df.groupby(col["cliente"])[col["valor"]]
-    .sum()
-    .sort_values(ascending=False)
-    .head(5)
-)
-
+clientes_ativos = df["Cliente"].nunique()
+ticket_medio = faturamento_total / len(df) if len(df) else 0
+top5 = df.groupby("Cliente")["ValorNF"].sum().sort_values(ascending=False).head(5)
 concentracao_top5 = top5.sum() / faturamento_total if faturamento_total > 0 else 0
 
-
-col1, col2, col3, col4, col5 = st.columns(5)
-
+col1,col2,col3,col4,col5 = st.columns(5)
 col1.metric("💰 Faturamento Total", f"R$ {faturamento_total:,.2f}")
-col2.metric("📆 Faturamento Mensal Atual", f"R$ {faturamento_mensal:,.2f}")
+col2.metric("🗓️ Faturamento Mensal Atual", f"R$ {faturamento_mensal:,.2f}")
 col3.metric("👥 Clientes Ativos", clientes_ativos)
 col4.metric("💳 Ticket Médio", f"R$ {ticket_medio:,.2f}")
 col5.metric("⚠️ Concentração Top 5", f"{concentracao_top5:.2%}")
-
-
 st.divider()
 
-
-# ==========================================
-# 1️⃣ EVOLUÇÃO TEMPORAL DO FATURAMENTO
-# ==========================================
-
+# -----------------------------------------
+# Análises Pedidas
+# -----------------------------------------
 st.subheader("📈 Evolução Temporal do Faturamento")
-
 st.line_chart(mensal)
 
-
-# ==========================================
-# 2️⃣ COMPOSIÇÃO POR SEGMENTO
-# ==========================================
-
-if col["segmento"]:
-    st.subheader("🏷️ Composição por Segmento de Mercado")
-
-    seg = (
-        df.groupby(col["segmento"])[col["valor"]]
-        .sum()
-        .sort_values(ascending=False)
-    )
-
-    st.bar_chart(seg)
-
-
-# ==========================================
-# 3️⃣ MATRIZ CLIENTE — VALOR vs FREQUÊNCIA
-# ==========================================
+st.subheader("📊 Top 10 Clientes por Faturamento")
+top10 = df.groupby("Cliente")["ValorNF"].sum().sort_values(ascending=False).head(10)
+st.bar_chart(top10)
 
 st.subheader("🔎 Matriz Cliente: Valor x Frequência")
+matriz = df.groupby("Cliente").agg(valor_total=("ValorNF","sum"), freq=("freq","sum"))
+st.scatter_chart(matriz)
 
-cliente_matrix = (
-    df.groupby(col["cliente"])
-    .agg(
-        valor_total=(col["valor"], "sum"),
-        frequencia=("freq", "sum")
-    )
-)
-
-st.scatter_chart(cliente_matrix)
-
-
-# ==========================================
-# 4️⃣ TOP 10 CLIENTES
-# ==========================================
-
-st.subheader("🥇 Top 10 Clientes por Faturamento")
-
-top10 = cliente_matrix.sort_values("valor_total", ascending=False).head(10)
-
-st.bar_chart(top10["valor_total"])
-
-st.dataframe(top10)
-
-
-# ==========================================
-# 5️⃣ SAZONALIDADE ANUAL
-# ==========================================
-
-st.subheader("📆 Sazonalidade Mensal do Faturamento")
-
-sazonalidade = (
-    df.groupby("mes_num")[col["valor"]]
-    .sum()
-    .reindex(range(1, 13), fill_value=0)
-)
-
+st.subheader("📆 Sazonalidade — Receita Mensal")
+sazonalidade = df.groupby("mes_num")["ValorNF"].sum().reindex(range(1,13), fill_value=0)
 st.bar_chart(sazonalidade)
 
-
-# ==========================================
-# 6️⃣ HIERARQUIA DE CLIENTES (ABC)
-# ==========================================
-
-st.subheader("🏆 Hierarquia de Clientes — Curva ABC")
-
-clientes = (
-    df.groupby(col["cliente"])[col["valor"]]
-    .sum()
-    .sort_values(ascending=False)
-    .reset_index()
-)
-
-clientes["%_participacao"] = clientes[col["valor"]] / clientes[col["valor"]].sum()
-clientes["%_acumulado"] = clientes["%_participacao"].cumsum()
-
-def classifica(x):
-    if x <= 0.8: return "A"
-    if x <= 0.95: return "B"
-    return "C"
-
-clientes["classe_abc"] = clientes["%_acumulado"].apply(classifica)
-
-st.dataframe(clientes)
-
-
-# ==========================================
-# 7️⃣ EVOLUÇÃO TRIMESTRAL
-# ==========================================
-
 st.subheader("📊 Evolução Trimestral de Receita")
-
-trimestre = (
-    df.groupby("trimestre")[col["valor"]]
-    .sum()
-)
-
-st.line_chart(trimestre)
-
-
-# ==========================================
-# 8️⃣ DISTRIBUIÇÃO DE TICKET MÉDIO
-# ==========================================
+trimestral = df.groupby("trimestre")["ValorNF"].sum()
+st.line_chart(trimestral)
 
 st.subheader("📦 Distribuição de Ticket Médio por Cliente")
-
-ticket = (
-    df.groupby(col["cliente"])[col["valor"]]
-    .mean()
-)
-
+ticket = df.groupby("Cliente")["ValorNF"].mean()
 st.bar_chart(ticket)
 
+st.subheader("🏆 Curva ABC de Clientes")
+abc = df.groupby("Cliente")["ValorNF"].sum().sort_values(ascending=False).reset_index()
+abc["%"] = abc["ValorNF"] / abc["ValorNF"].sum()
+abc["%_acum"] = abc["%"].cumsum()
+abc["Classe"] = abc["%_acum"].apply(lambda x: "A" if x<=0.8 else ("B" if x<=0.95 else "C"))
+st.dataframe(abc)
 
-# ==========================================
-# 9️⃣ SAZONALIDADE + RISCO DE CONCENTRAÇÃO
-# ==========================================
-
-st.subheader("⚠️ Indicadores de Sazonalidade e Risco")
-
-sazonalidade_pct = sazonalidade / sazonalidade.sum()
-
-st.write("📌 Sazonalidade (%) por mês")
-st.dataframe(sazonalidade_pct.apply(lambda x: f"{x:.2%}"))
-
-
-st.info("Modelo projetado para análise fiscal estratégica e tomada de decisão.")
+st.info("📊 Dashboard pronto para uso em produção.")
