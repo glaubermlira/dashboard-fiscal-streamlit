@@ -68,29 +68,25 @@ else:
 # NORMALIZAÇÃO DE COLUNAS
 # ==========================================
 
-df.columns = [c.lower().strip().replace(" ", "_") for c in df.columns]
-
-MAP = {
-    "data": ["data", "data_emissao", "dt_emissao"],
-    "valor": ["valor", "valor_total", "total_nf", "valor_nf"],
-    "cliente": ["cliente", "razao_social", "razaosocial", "nome_cliente"],
-    "segmento": ["segmento", "categoria_cliente", "setor"],
-    "produto": ["produto", "descricao_produto", "item", "servico"],
-    "cfop": ["cfop"],
-    "cst": ["cst"]
-}
-
-def find_col(options):
-    for o in options:
-        if o in df.columns:
-            return o
+def localizar_coluna(possiveis, df):
+    for p in possiveis:
+        for c in df.columns:
+            if c.strip().lower() == p.strip().lower():
+                return c
     return None
 
-col = {k: find_col(v) for k, v in MAP.items()}
+col = {
+    "data": localizar_coluna(["data", "data emissão", "dt_emissao", "emissao"], df),
+    "cliente": localizar_coluna(["cliente", "razao social", "destinatário"], df),
+    "produto": localizar_coluna(["produto", "item", "descricao produto"], df),
+    "valor": localizar_coluna(["valornf", "valor total", "total nf", "vnf", "vl_total"], df),
+}
 
-if col["data"]:
-    df[col["data"]] = pd.to_datetime(df[col["data"]], errors="coerce")
-    df = df.dropna(subset=[col["data"]])
+faltando = [k for k,v in col.items() if v is None]
+if faltando:
+    st.error(f"As seguintes colunas não foram encontradas: {faltando}")
+    st.stop()
+
 
 
 # ==========================================
